@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The UI imports the sibling web-kit (../../web-kit/src/...); CI doesn't get
+      # it from the checkout, so clone it to the sibling path the imports resolve to.
+      - name: Fetch web-kit (sibling dependency)
+        run: git clone --depth 1 https://github.com/doumouya/web-kit.git ../web-kit
       - uses: actions/setup-node@v4
         with:
           node-version: 20
