@@ -273,13 +273,15 @@ async function renderTable(): Promise<void> {
   selAll.checked = rowIndices.length > 0 && onPage === rowIndices.length;
   selAll.indeterminate = onPage > 0 && onPage < rowIndices.length;
   headRow.append(el("th", { class: "col-chk" }, selAll));
+  // numeric columns (int/float) get right-aligned tabular-mono cells
+  const numericCols = new Set(cols.filter((c) => c.dtype === "int" || c.dtype === "float").map((c) => c.name));
   visible.forEach(({ name }) => {
     const meta = cols.find((c) => c.name === name);
-    const indicator = sort?.col === name ? (sort.descending ? " ▼" : " ▲") : "";
-    headRow.append(el("th", { class: "sortable", "data-col": name, title: `Sort by ${name}` },
+    const arrow = sort?.col === name ? (sort.descending ? "▼" : "▲") : "";
+    headRow.append(el("th", { class: numericCols.has(name) ? "sortable num" : "sortable", "data-col": name, title: `Sort by ${name}` },
       el("span", { class: "th-name" }, name),
       meta ? el("span", { class: `dtype dtype-${meta.dtype}` }, meta.dtype) : null,
-      indicator));
+      el("span", { class: "th-sort" }, arrow)));
   });
 
   // body: each row carries its frame index; cells are editable in edit mode
@@ -292,11 +294,14 @@ async function renderTable(): Promise<void> {
     tr.append(el("td", { class: "col-chk" }, rowCb));
     visible.forEach(({ name, i }) => {
       const cell = row[i];
-      const display = cell == null ? (editable ? "" : "—") : cell;
+      const isNull = cell == null;
+      const display = isNull ? (editable ? "" : "—") : cell;
+      const cls = `${isNull ? "null cell" : "cell"}${numericCols.has(name) ? " num" : ""}`;
       tr.append(el("td", {
-        class: cell == null ? "null cell" : "cell",
+        class: cls,
         "data-col": name,
         "data-orig": display,
+        title: isNull ? null : String(display),  // native tooltip reveals truncated values
         contenteditable: editable ? "true" : null,
       }, display));
     });
@@ -309,14 +314,48 @@ async function renderTable(): Promise<void> {
 }
 
 function renderPager(total: number): void {
-  const to = Math.min(offset + pageLimit, total);
-  setKids(byId("count"),
+  const limit = Math.max(1, pageLimit);
+  const to = Math.min(offset + limit, total);
+  const pageCount = Math.max(1, Math.ceil(total / limit));
+  const current = Math.min(pageCount, Math.floor(offset / limit) + 1);
+  const goTo = (p: number) => { const np = Math.min(pageCount, Math.max(1, p)); offset = (np - 1) * limit; void renderTable(); };
+
+  const summary = el("div", { class: "pager-summary" },
     el("span", {}, `${total.toLocaleString()} rows × ${cols.length} cols`),
-    el("span", { class: "muted" }, total ? `  ·  showing ${offset + 1}–${to}` : ""),
-    searchQ ? el("span", { class: "muted" }, `  ·  matching “${searchQ}”`) : null,
-    total > pageLimit ? iconButton("‹", { label: "previous page", size: "sm", onClick: () => { if (offset > 0) { offset = Math.max(0, offset - pageLimit); void renderTable(); } } }) : null,
-    total > pageLimit ? iconButton("›", { label: "next page", size: "sm", onClick: () => { if (offset + pageLimit < total) { offset += pageLimit; void renderTable(); } } }) : null,
-  );
+    total ? el("span", { class: "muted" }, ` · showing ${(offset + 1).toLocaleString()}–${to.toLocaleString()} of ${total.toLocaleString()}` ) : null,
+    searchQ ? el("span", { class: "muted" }, ` · matching “${searchQ}”`) : null);
+
+  const nav = el("div", { class: "pager-nav" });
+  if (pageCount > 1) {
+    nav.append(iconButton("‹", { label: "previous page", size: "sm", onClick: () => goTo(current - 1) }));
+    for (const p of pageWindow(current, pageCount)) {
+      if (p === 0) { nav.append(el("span", { class: "pager-gap" }, "…")); continue; }
+      const b = button(String(p), { variant: p === current ? "primary" : "ghost", size: "sm", onClick: () => goTo(p) });
+      b.classList.add("pager-page");
+      if (p === current) b.setAttribute("aria-current", "page");
+      nav.append(b);
+    }
+    nav.append(iconButton("›", { label: "next page", size: "sm", onClick: () => goTo(current + 1) }));
+  }
+
+  setKids(byId("pager"), summary, el("span", { class: "spacer" }), nav, rowsPerPage());
+}
+
+// Windowed page list: first two, last two, and current±1, with 0 marking an elided gap (…).
+function pageWindow(current: number, count: number): number[] {
+  if (count <= 7) return Array.from({ length: count }, (_, i) => i + 1);
+  const keep = [1, 2, count - 1, count, current - 1, current, current + 1].filter((p) => p >= 1 && p <= count);
+  const sorted = [...new Set(keep)].sort((a, b) => a - b);
+  const out: number[] = [];
+  let prev = 0;
+  for (const p of sorted) { if (p - prev > 1) out.push(0); out.push(p); prev = p; }
+  return out;
+}
+
+function openToolsDrawer(): void {
+  renderTools();
+  if (!cols.length) setKids(byId("tools"), el("div", { class: "tools-section" }, el("p", { class: "muted" }, "Load a CSV to use the cleaning tools.")));
+  (byId("tools-drawer") as HTMLDialogElement).showModal();
 }
 
 // Delegated table interactions — attached once to the persistent #table host, so they
@@ -352,6 +391,10 @@ function wireTable(): void {
     const orig = td.getAttribute("data-orig") ?? "";
     const next = (td.textContent ?? "").trim();
     if (next === orig) return;
+    // Stamp the new value as the baseline BEFORE staging: committing re-renders the table, and if this
+    // cell still holds focus the browser fires a second focusout on the (now stale) node — making that
+    // re-fire a no-op (next === orig) so one edit can't commit twice.
+    td.setAttribute("data-orig", next);
     const tr = td.closest("tr[data-idx]") as HTMLElement;
     stageSteps([step("set_cell", {
       row: Number(tr.getAttribute("data-idx")),
@@ -605,16 +648,27 @@ function buildChrome(): void {
     el("span", { class: "dt-sep" }),
     undoBtn, redoBtn,
     el("span", { class: "dt-sep" }),
-    rowsPerPage(),
     columnsDropdown(),
     el("span", { id: "selChip", class: "dt-selchip" }),
-    el("span", { class: "spacer" }));
+    el("span", { class: "spacer" }),
+    button("Clean tools", { variant: "secondary", size: "sm", onClick: openToolsDrawer }));
+
+  // The cleaning tools live in a right slide-over so the centered table card stays the hero.
+  const drawer = el("dialog", { id: "tools-drawer", class: "tools-drawer" },
+    el("div", { class: "drawer-head" },
+      iconButton("✕", { label: "close tools", size: "sm", onClick: () => drawer.close() })),
+    el("aside", { id: "tools", class: "tools-pane" })) as HTMLDialogElement;
+  // a backdrop click lands on the <dialog> itself (never an inner node) — use that to close
+  drawer.addEventListener("click", (e) => { if (e.target === drawer) drawer.close(); });
 
   byId("root").append(
     header,
     toolbar,
-    el("div", { id: "count", class: "count" }),
-    el("main", { class: "layout" }, el("section", { id: "table", class: "table-pane" }), el("aside", { id: "tools", class: "tools-pane" })));
+    el("main", { class: "page" },
+      el("div", { class: "table-card" },
+        el("section", { id: "table", class: "table-pane" }),
+        el("div", { id: "pager", class: "pager" }))),
+    drawer);
 
   wireTable();
 }

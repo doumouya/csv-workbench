@@ -52,10 +52,9 @@ hr {
 /* ============================================================
    Datacore — Colors
    ------------------------------------------------------------
-   Source of truth: advanced-datatable `web/style.css`, which
-   uses a cool neutral (gray/slate) palette + a single blue
-   accent, with a hand-authored dark theme via prefers-color-
-   scheme. We formalize that into base ramps + semantic aliases,
+   The palette is a cool neutral (gray/slate) ramp + a single
+   blue accent, with a hand-authored dark theme via prefers-
+   color-scheme. We formalize that into base ramps + semantic aliases,
    and add restrained status hues for the build-engine work
    tracker (backlog / in_progress / in_review / done, close-check
    pass/fail, reject states).
