@@ -16,7 +16,8 @@ body { margin: 0; font: var(--font-body); background: var(--surface); color: var
 
 /* ---------- toolbar (workspace-style: search · row modes · undo/redo · rows · columns · selection) ---------- */
 .dt-toolbar { flex: none; display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3);
-  border-bottom: var(--border-width) solid var(--border); background: var(--surface); overflow: visible; }
+  border-bottom: var(--border-width) solid var(--border); background: var(--surface); overflow: visible;
+  border-top-left-radius: var(--radius-lg); border-top-right-radius: var(--radius-lg); }
 .dt-sep { width: var(--border-width); align-self: stretch; margin: var(--space-1) var(--space-1); background: var(--border); }
 
 .dt-search { display: flex; align-items: center; gap: var(--space-1); padding: 0 var(--space-2); min-width: 14rem;
@@ -52,13 +53,16 @@ body { margin: 0; font: var(--font-body); background: var(--surface); color: var
 .table-card { width: 100%; max-width: 84rem; margin-inline: auto; align-self: flex-start;
   display: flex; flex-direction: column; min-height: 0; max-height: 100%;
   background: var(--surface); border: var(--border-width) solid var(--border);
-  border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow-popover); }
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-popover); }
+/* no overflow:hidden — the toolbar's column dropdown must escape; the toolbar (top)
+   and pager (bottom) round their own outer corners so the card's radius stays clean */
 .table-pane { flex: 1 1 auto; min-height: 0; overflow: auto; }
 
 /* pagination footer, pinned inside the card */
 .pager { flex: none; display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
   padding: var(--space-2) var(--space-3); border-top: var(--border-width) solid var(--border);
-  background: var(--surface); font-size: var(--text-sm); color: var(--text-muted); }
+  background: var(--surface); font-size: var(--text-sm); color: var(--text-muted);
+  border-bottom-left-radius: var(--radius-lg); border-bottom-right-radius: var(--radius-lg); }
 .pager .spacer { flex: 1 1 auto; }
 .pager-summary { display: inline-flex; align-items: baseline; }
 .pager-nav { display: inline-flex; align-items: center; gap: var(--space-1); }

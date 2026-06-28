@@ -1020,13 +1020,14 @@
     });
     byId("root").append(
       header,
-      toolbar,
       el(
         "main",
         { class: "page" },
         el(
           "div",
           { class: "table-card" },
+          toolbar,
+          // the toolbar is the card's top — coupled to the table it drives
           el("section", { id: "table", class: "table-pane" }),
           el("div", { id: "pager", class: "pager" })
         )
