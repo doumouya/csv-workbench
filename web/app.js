@@ -392,16 +392,24 @@
       worker.postMessage({ id, op, payload });
     });
   }
-  var PAGE_LIMIT = 200;
+  var pageLimit = 100;
   var cols = [];
   var applied = [];
   var redo = [];
   var selection = /* @__PURE__ */ new Set();
+  var selectedRows = /* @__PURE__ */ new Set();
+  var rowIndices = [];
+  var hiddenCols = /* @__PURE__ */ new Set();
+  var mode = "";
+  var searchQ = "";
+  var searchDebounce;
   var sort = null;
   var offset = 0;
   var totalRows = 0;
   var cleanness = null;
   var activeOp = null;
+  var undoBtn;
+  var redoBtn;
   var byId = (id) => document.getElementById(id);
   function setKids(host, ...kids) {
     host.replaceChildren(...kids.filter((k) => k != null && k !== false));
@@ -432,9 +440,14 @@
       applied.length = 0;
       redo.length = 0;
       selection.clear();
+      selectedRows.clear();
+      hiddenCols.clear();
       sort = null;
       offset = 0;
+      searchQ = "";
+      mode = "";
       totalRows = dims.rows;
+      resetToolbarUi();
       await refresh();
       setStatus("");
     } catch (e) {
@@ -447,10 +460,14 @@
     cols = JSON.parse(await engineCall("columns_meta"));
     const names = new Set(cols.map((c) => c.name));
     for (const s of [...selection]) if (!names.has(s)) selection.delete(s);
+    for (const h of [...hiddenCols]) if (!names.has(h)) hiddenCols.delete(h);
     if (sort && !names.has(sort.col)) sort = null;
     if (offset >= totalRows) offset = 0;
+    selectedRows.clear();
     renderTools();
     await renderTable();
+    syncToolbar();
+    syncSelChip();
     rescore();
   }
   async function rescore() {
@@ -484,6 +501,14 @@
     applied.push(...grp);
     void refresh();
   }
+  function undoTo(n) {
+    while (applied.length > n) redo.push([applied.pop()]);
+    void refresh();
+  }
+  function redoTo(k) {
+    for (let i = 0; i < k && redo.length; i++) applied.push(...redo.pop());
+    void refresh();
+  }
   async function exportCsv() {
     const csv = await engineCall("to_csv");
     const blob = new Blob([csv], { type: "text/csv" });
@@ -502,54 +527,154 @@
       }));
       return;
     }
-    const query = sort ? JSON.stringify({ sort: [{ col: sort.col, ascending: sort.ascending }] }) : null;
-    const page = JSON.parse(await engineCall("view", { query, offset, limit: PAGE_LIMIT }));
+    const q = {};
+    if (searchQ) q.search = searchQ;
+    if (sort) q.sort = [{ col: sort.col, descending: sort.descending }];
+    const query = Object.keys(q).length ? JSON.stringify(q) : null;
+    const page = JSON.parse(await engineCall("view", { query, offset, limit: pageLimit }));
+    rowIndices = page.indices ?? page.rows.map((_, i) => offset + i);
+    const visible = page.columns.map((name, i) => ({ name, i })).filter(({ name }) => !hiddenCols.has(name));
     const headRow = el("tr");
-    page.columns.forEach((name) => {
+    const selAll = el("input", { type: "checkbox", id: "selAll", class: "row-chk", "aria-label": "select all rows on this page" });
+    const onPage = rowIndices.filter((ix) => selectedRows.has(ix)).length;
+    selAll.checked = rowIndices.length > 0 && onPage === rowIndices.length;
+    selAll.indeterminate = onPage > 0 && onPage < rowIndices.length;
+    headRow.append(el("th", { class: "col-chk" }, selAll));
+    visible.forEach(({ name }) => {
       const meta = cols.find((c) => c.name === name);
-      const indicator = sort?.col === name ? sort.ascending ? " \u25B2" : " \u25BC" : "";
-      const th = el(
+      const indicator = sort?.col === name ? sort.descending ? " \u25BC" : " \u25B2" : "";
+      headRow.append(el(
         "th",
-        {},
+        { class: "sortable", "data-col": name, title: `Sort by ${name}` },
         el("span", { class: "th-name" }, name),
         meta ? el("span", { class: `dtype dtype-${meta.dtype}` }, meta.dtype) : null,
         indicator
-      );
-      th.addEventListener("click", () => {
-        if (sort?.col === name) sort = { col: name, ascending: !sort.ascending };
-        else sort = { col: name, ascending: true };
-        void renderTable();
-      });
-      headRow.append(th);
+      ));
     });
+    const editable = mode === "edit";
     const body = el("tbody");
-    for (const row of page.rows) {
-      const tr = el("tr");
-      row.forEach((cell) => tr.append(el("td", { class: cell == null ? "null" : "" }, cell == null ? "\u2014" : cell)));
+    page.rows.forEach((row, r) => {
+      const absIdx = rowIndices[r];
+      const tr = el("tr", { "data-idx": String(absIdx), class: selectedRows.has(absIdx) ? "is-selected" : "" });
+      const rowCb = el("input", { type: "checkbox", class: "row-chk", checked: selectedRows.has(absIdx), "aria-label": "select row" });
+      tr.append(el("td", { class: "col-chk" }, rowCb));
+      visible.forEach(({ name, i }) => {
+        const cell = row[i];
+        const display = cell == null ? editable ? "" : "\u2014" : cell;
+        tr.append(el("td", {
+          class: cell == null ? "null cell" : "cell",
+          "data-col": name,
+          "data-orig": display,
+          contenteditable: editable ? "true" : null
+        }, display));
+      });
       body.append(tr);
-    }
-    host.replaceChildren(el("div", { class: "wrap" }, el("table", {}, el("thead", {}, headRow), body)));
+    });
+    host.replaceChildren(el(
+      "div",
+      { class: "wrap" },
+      el("table", { class: `dt mode-${mode || "view"}` }, el("thead", {}, headRow), body)
+    ));
     renderPager(page.total);
   }
   function renderPager(total) {
-    const to = Math.min(offset + PAGE_LIMIT, total);
+    const to = Math.min(offset + pageLimit, total);
     setKids(
       byId("count"),
       el("span", {}, `${total.toLocaleString()} rows \xD7 ${cols.length} cols`),
       el("span", { class: "muted" }, total ? `  \xB7  showing ${offset + 1}\u2013${to}` : ""),
-      total > PAGE_LIMIT ? iconButton("\u2039", { label: "previous page", size: "sm", onClick: () => {
+      searchQ ? el("span", { class: "muted" }, `  \xB7  matching \u201C${searchQ}\u201D`) : null,
+      total > pageLimit ? iconButton("\u2039", { label: "previous page", size: "sm", onClick: () => {
         if (offset > 0) {
-          offset = Math.max(0, offset - PAGE_LIMIT);
+          offset = Math.max(0, offset - pageLimit);
           void renderTable();
         }
       } }) : null,
-      total > PAGE_LIMIT ? iconButton("\u203A", { label: "next page", size: "sm", onClick: () => {
-        if (offset + PAGE_LIMIT < total) {
-          offset += PAGE_LIMIT;
+      total > pageLimit ? iconButton("\u203A", { label: "next page", size: "sm", onClick: () => {
+        if (offset + pageLimit < total) {
+          offset += pageLimit;
           void renderTable();
         }
       } }) : null
     );
+  }
+  function wireTable() {
+    const host = byId("table");
+    host.addEventListener("click", (e) => {
+      const t = e.target;
+      if (t.closest("input")) return;
+      const th = t.closest("th.sortable");
+      if (th) {
+        onSort(th.getAttribute("data-col"));
+        return;
+      }
+      if (mode === "delete") {
+        const tr = t.closest("tr[data-idx]");
+        if (tr) stageSteps([step("drop_rows", { indices: [Number(tr.getAttribute("data-idx"))] })]);
+      }
+    });
+    host.addEventListener("change", (e) => {
+      const t = e.target;
+      if (t.id === "selAll") {
+        toggleSelectAll(t.checked);
+        return;
+      }
+      if (t.classList.contains("row-chk")) {
+        const tr = t.closest("tr[data-idx]");
+        const idx = Number(tr.getAttribute("data-idx"));
+        if (t.checked) selectedRows.add(idx);
+        else selectedRows.delete(idx);
+        tr.classList.toggle("is-selected", t.checked);
+        syncSelChip();
+        syncSelAll();
+      }
+    });
+    host.addEventListener("focusout", (e) => {
+      if (mode !== "edit") return;
+      const td = e.target.closest("td.cell");
+      if (!td || td.getAttribute("contenteditable") !== "true") return;
+      const orig = td.getAttribute("data-orig") ?? "";
+      const next = (td.textContent ?? "").trim();
+      if (next === orig) return;
+      const tr = td.closest("tr[data-idx]");
+      stageSteps([step("set_cell", {
+        row: Number(tr.getAttribute("data-idx")),
+        column: td.getAttribute("data-col"),
+        value: next === "" ? null : next
+      })]);
+    });
+  }
+  function onSort(colName) {
+    sort = sort?.col === colName ? { col: colName, descending: !sort.descending } : { col: colName, descending: false };
+    offset = 0;
+    void renderTable();
+  }
+  function toggleSelectAll(checked) {
+    for (const ix of rowIndices) {
+      if (checked) selectedRows.add(ix);
+      else selectedRows.delete(ix);
+    }
+    byId("table").querySelectorAll("tbody .row-chk").forEach((cb) => {
+      cb.checked = checked;
+      cb.closest("tr")?.classList.toggle("is-selected", checked);
+    });
+    syncSelChip();
+  }
+  function syncSelAll() {
+    const selAll = document.getElementById("selAll");
+    if (!selAll) return;
+    const onPage = rowIndices.filter((ix) => selectedRows.has(ix)).length;
+    selAll.checked = rowIndices.length > 0 && onPage === rowIndices.length;
+    selAll.indeterminate = onPage > 0 && onPage < rowIndices.length;
+  }
+  function clearSelection() {
+    selectedRows.clear();
+    byId("table").querySelectorAll(".row-chk").forEach((cb) => {
+      cb.checked = false;
+      cb.indeterminate = false;
+    });
+    byId("table").querySelectorAll(".is-selected").forEach((r) => r.classList.remove("is-selected"));
+    syncSelChip();
   }
   function renderTools() {
     const host = byId("tools");
@@ -602,15 +727,20 @@
           renderTools();
         } }) : null
       ),
-      el("div", { class: "tools-section" }, el("h3", {}, "Columns"), list),
-      el("div", { class: "tools-section" }, el("h3", {}, "Whole file"), el("div", { class: "op-grid" }, ...GLOBAL_OPS.map(opBtn))),
       el(
         "div",
-        { class: "tools-section" },
-        el("h3", {}, "Selected columns", n ? el("span", { class: "sel-count" }, ` \xB7 ${n} selected`) : null),
-        el("div", { class: "op-grid" }, ...COLUMN_OPS.map(opBtn))
+        { class: "tools-body" },
+        el("div", { class: "tools-section" }, el("h3", {}, "Columns"), list),
+        el("div", { class: "tools-section" }, el("h3", {}, "Whole file"), el("div", { class: "op-grid" }, ...GLOBAL_OPS.map(opBtn))),
+        el(
+          "div",
+          { class: "tools-section" },
+          el("h3", {}, "Selected columns", n ? el("span", { class: "sel-count" }, ` \xB7 ${n} selected`) : null),
+          el("div", { class: "op-grid" }, ...COLUMN_OPS.map(opBtn))
+        ),
+        activeOp ? actionSheet(activeOp) : null
       ),
-      activeOp ? actionSheet(activeOp) : null
+      historySection()
     );
   }
   function actionSheet(op) {
@@ -657,6 +787,140 @@
       )
     );
   }
+  function historySection() {
+    const items = [];
+    items.push(histRow("Original dataset", () => undoTo(0), applied.length === 0 ? "is-current" : "is-done"));
+    applied.forEach((s, i) => items.push(histRow(stepLabel(s), () => undoTo(i + 1), i === applied.length - 1 ? "is-current" : "is-done")));
+    const redoable = [...redo].reverse().flatMap((g) => g);
+    redoable.forEach((s, i) => items.push(histRow(stepLabel(s), () => redoTo(i + 1), "is-future")));
+    return el(
+      "div",
+      { class: "tools-section history" },
+      el(
+        "div",
+        { class: "history-head" },
+        el("h3", {}, "History"),
+        el("span", { class: "sel-count" }, ` \xB7 ${applied.length} step${applied.length === 1 ? "" : "s"}`)
+      ),
+      el("div", { class: "hist-list" }, ...items)
+    );
+  }
+  function histRow(label, onClick, cls) {
+    return el(
+      "button",
+      { class: `hist-item ${cls}`, type: "button", title: "Revert to this point", onclick: onClick },
+      el("span", { class: "hist-dot" }),
+      el("span", { class: "hist-label" }, label)
+    );
+  }
+  function stepLabel(s) {
+    const op = OPS.find((o) => o.id === s.kind);
+    if (op) return op.label.replace(/…$/, "");
+    switch (s.kind) {
+      case "set_cell":
+        return `Edit cell \xB7 ${String(s.params.column ?? "")}`;
+      case "drop_rows": {
+        const k = s.params.indices?.length ?? 0;
+        return `Delete ${k} row${k === 1 ? "" : "s"}`;
+      }
+      case "original":
+        return "Original";
+      default:
+        return s.kind.replace(/_/g, " ");
+    }
+  }
+  function searchBox() {
+    const inp = el("input", { type: "search", class: "dt-search-input", placeholder: "Search all columns\u2026", "aria-label": "search the table" });
+    inp.addEventListener("input", () => {
+      const v = inp.value.trim();
+      if (v === searchQ) return;
+      searchQ = v;
+      if (searchDebounce !== void 0) clearTimeout(searchDebounce);
+      searchDebounce = window.setTimeout(() => {
+        offset = 0;
+        void renderTable();
+      }, 180);
+    });
+    return el("div", { class: "dt-search" }, el("span", { class: "dt-search-ico" }, "\u2315"), inp);
+  }
+  function modeButton(m, glyph, title) {
+    const b = iconButton(glyph, { label: title, size: "sm", onClick: () => {
+      if (m === "delete" && selectedRows.size) {
+        stageSteps([step("drop_rows", { indices: [...selectedRows] })]);
+        return;
+      }
+      setMode(mode === m ? "" : m);
+    } });
+    b.classList.add("dt-mode");
+    b.setAttribute("data-mode", m);
+    b.setAttribute("title", title);
+    return b;
+  }
+  function setMode(m) {
+    mode = m;
+    selectedRows.clear();
+    document.querySelectorAll(".dt-mode").forEach((b) => b.classList.toggle("is-active", b.getAttribute("data-mode") === m && m !== ""));
+    syncSelChip();
+    void renderTable();
+  }
+  function rowsPerPage() {
+    const field = select({ size: "sm", children: [50, 100, 200, 500].map((nn) => el("option", { value: String(nn), selected: nn === pageLimit }, `${nn}/page`)) });
+    const sel = field.querySelector("select");
+    sel.addEventListener("change", () => {
+      pageLimit = Number(sel.value);
+      offset = 0;
+      void renderTable();
+    });
+    field.classList.add("dt-rows");
+    return field;
+  }
+  function columnsDropdown() {
+    const menu = el("div", { class: "dt-menu", hidden: true });
+    const toggle = iconButton("\u25A6", { label: "Show / hide columns", size: "sm", onClick: () => {
+      if (menu.hasAttribute("hidden")) {
+        fillColumnsMenu(menu);
+        menu.removeAttribute("hidden");
+      } else menu.setAttribute("hidden", "");
+    } });
+    toggle.setAttribute("title", "Show / hide columns");
+    const wrap = el("div", { class: "dt-dd" }, toggle, menu);
+    document.addEventListener("click", (e) => {
+      if (!wrap.contains(e.target)) menu.setAttribute("hidden", "");
+    });
+    return wrap;
+  }
+  function fillColumnsMenu(menu) {
+    setKids(menu, ...cols.map((c) => {
+      const cb = el("input", { type: "checkbox", checked: !hiddenCols.has(c.name) });
+      cb.addEventListener("change", () => {
+        cb.checked ? hiddenCols.delete(c.name) : hiddenCols.add(c.name);
+        void renderTable();
+      });
+      return el("label", { class: "dt-menu-item" }, cb, el("span", { class: "dt-menu-name" }, c.name));
+    }));
+  }
+  function syncSelChip() {
+    const chip = byId("selChip");
+    const n = selectedRows.size;
+    chip.classList.toggle("show", n > 0);
+    setKids(
+      chip,
+      n ? el("span", { class: "sel-n" }, `${n} selected`) : null,
+      n ? button("Delete rows", { variant: "secondary", size: "sm", onClick: () => {
+        if (selectedRows.size) stageSteps([step("drop_rows", { indices: [...selectedRows] })]);
+      } }) : null,
+      n ? iconButton("\u2715", { label: "clear selection", size: "sm", onClick: clearSelection }) : null
+    );
+  }
+  function syncToolbar() {
+    undoBtn?.classList.toggle("is-off", applied.length === 0);
+    redoBtn?.classList.toggle("is-off", redo.length === 0);
+  }
+  function resetToolbarUi() {
+    const si = document.querySelector(".dt-search-input");
+    if (si) si.value = "";
+    document.querySelectorAll(".dt-mode").forEach((b) => b.classList.remove("is-active"));
+  }
   function renderChip() {
     const host = byId("chip");
     host.replaceChildren(
@@ -670,6 +934,10 @@
     const file = el("input", { type: "file", accept: ".csv,text/csv" });
     file.hidden = true;
     file.addEventListener("change", () => void openFile(file.files?.[0]));
+    undoBtn = iconButton("\u21B6", { label: "undo", size: "sm", onClick: undo });
+    redoBtn = iconButton("\u21B7", { label: "redo", size: "sm", onClick: redoAction });
+    undoBtn.setAttribute("title", "Undo");
+    redoBtn.setAttribute("title", "Redo");
     const header = el(
       "header",
       { class: "app-header" },
@@ -678,18 +946,35 @@
       el("span", { id: "status", class: "status" }),
       el("span", { class: "spacer" }),
       el("span", { id: "chip", class: "chip" }),
-      iconButton("\u21B6", { label: "undo", size: "sm", onClick: undo }),
-      iconButton("\u21B7", { label: "redo", size: "sm", onClick: redoAction }),
       button("Load sample", { onClick: loadSample }),
       button("Open CSV", { variant: "primary", onClick: () => file.click() }),
       button("Export CSV", { onClick: () => void exportCsv() }),
       file
     );
+    const toolbar = el(
+      "div",
+      { class: "dt-toolbar" },
+      searchBox(),
+      el("span", { class: "dt-sep" }),
+      modeButton("edit", "\u270E", "Edit cells"),
+      modeButton("select", "\u2611", "Select rows"),
+      modeButton("delete", "\u{1F5D1}", "Delete rows"),
+      el("span", { class: "dt-sep" }),
+      undoBtn,
+      redoBtn,
+      el("span", { class: "dt-sep" }),
+      rowsPerPage(),
+      columnsDropdown(),
+      el("span", { id: "selChip", class: "dt-selchip" }),
+      el("span", { class: "spacer" })
+    );
     byId("root").append(
       header,
+      toolbar,
       el("div", { id: "count", class: "count" }),
       el("main", { class: "layout" }, el("section", { id: "table", class: "table-pane" }), el("aside", { id: "tools", class: "tools-pane" }))
     );
+    wireTable();
   }
   window.addEventListener("DOMContentLoaded", () => {
     worker = new Worker(new URL("worker.js", location.href).href);

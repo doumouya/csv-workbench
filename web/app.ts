@@ -1,7 +1,10 @@
 /* csv-workbench — a Polars→WebAssembly CSV cleaning workbench that runs entirely
    in the browser. The engine (the `data` crate compiled to wasm) lives in a Web
-   Worker (web/worker.js); this file is the UI: a windowed data table + a tools
-   panel of cleaning operations, with non-destructive undo/redo. Built with
+   Worker (web/worker.js); this file is the UI: a windowed data table with a
+   workspace-style toolbar (live search · edit/select/delete row modes · undo/redo)
+   and a Clean-tools side panel that ends in an always-visible step-History strip.
+   All edits are non-destructive engine steps (replayed from an immutable base),
+   so undo/redo and "revert to here" are just "replay a shorter list". Built with
    web-kit components + tokens; the DOM is built with el() — no innerHTML. */
 import { el } from "../../web-kit/src/el";
 import { button } from "../../web-kit/src/components/button";
@@ -27,6 +30,7 @@ interface Page {
   columns: string[];
   rows: (string | null)[][];
   total: number;
+  indices: number[]; // each row's STABLE index in the current frame (pre filter/sort)
 }
 interface Field {
   key: string;
@@ -45,6 +49,7 @@ interface OpDef {
   fields: Field[];
   build: (sel: string[], v: Record<string, string | boolean>) => Step[];
 }
+type Mode = "" | "edit" | "select" | "delete";
 
 const step = (kind: string, params: Record<string, unknown>): Step => ({ kind, params });
 
@@ -104,16 +109,24 @@ function engineCall<T = unknown>(op: string, payload?: unknown): Promise<T> {
 }
 
 // ---------- state ----------
-const PAGE_LIMIT = 200;
+let pageLimit = 100;                         // rows per page (toolbar pill)
 let cols: ColumnMeta[] = [];
-const applied: Step[] = [];
-const redo: Step[][] = [];
-const selection = new Set<string>();
-let sort: { col: string; ascending: boolean } | null = null;
+const applied: Step[] = [];                  // the committed cleaning pipeline
+const redo: Step[][] = [];                   // undone steps, newest-first (each group = one undo)
+const selection = new Set<string>();         // selected COLUMN names (tools panel)
+const selectedRows = new Set<number>();      // selected ROW indices in the current frame
+let rowIndices: number[] = [];               // displayed row → its frame index (from view.indices)
+const hiddenCols = new Set<string>();        // columns toggled off in the table (client-side only)
+let mode: Mode = "";                         // table interaction mode
+let searchQ = "";                            // free-text view filter
+let searchDebounce: number | undefined;
+let sort: { col: string; descending: boolean } | null = null;
 let offset = 0;
 let totalRows = 0;
 let cleanness: number | null = null;
-let activeOp: OpDef | null = null; // op whose action-sheet is open
+let activeOp: OpDef | null = null;           // op whose action-sheet is open
+let undoBtn: HTMLElement;
+let redoBtn: HTMLElement;
 
 const byId = (id: string): HTMLElement => document.getElementById(id) as HTMLElement;
 /** replaceChildren that drops nullish/false children (unlike the native one). */
@@ -150,8 +163,11 @@ async function openFile(file: File | undefined): Promise<void> {
   const buf = await file.arrayBuffer();
   try {
     const dims = await engineCall<{ rows: number; cols: number }>("load", { bytes: buf, tld: undefined });
-    applied.length = 0; redo.length = 0; selection.clear(); sort = null; offset = 0;
+    applied.length = 0; redo.length = 0;
+    selection.clear(); selectedRows.clear(); hiddenCols.clear();
+    sort = null; offset = 0; searchQ = ""; mode = "";
     totalRows = dims.rows;
+    resetToolbarUi();
     await refresh();
     setStatus("");
   } catch (e) {
@@ -159,18 +175,22 @@ async function openFile(file: File | undefined): Promise<void> {
   }
 }
 
-// Re-derive the current frame (set_steps), then repaint headers + table + score.
+// Re-derive the current frame (set_steps), then repaint headers + table + tools + score.
 async function refresh(): Promise<void> {
   const dims = await engineCall<{ rows: number; cols: number }>("set_steps", { steps: JSON.stringify(applied) });
   totalRows = dims.rows;
   cols = JSON.parse(await engineCall<string>("columns_meta"));
-  // prune selection / sort that no longer exist
+  // prune selection / hidden / sort that no longer exist
   const names = new Set(cols.map((c) => c.name));
   for (const s of [...selection]) if (!names.has(s)) selection.delete(s);
+  for (const h of [...hiddenCols]) if (!names.has(h)) hiddenCols.delete(h);
   if (sort && !names.has(sort.col)) sort = null;
   if (offset >= totalRows) offset = 0;
+  selectedRows.clear(); // a step re-derived the frame, so any held row indices are stale
   renderTools();
   await renderTable();
+  syncToolbar();
+  syncSelChip();
   rescore();
 }
 
@@ -184,7 +204,7 @@ async function rescore(): Promise<void> {
   renderChip();
 }
 
-// ---------- ops ----------
+// ---------- step pipeline (apply / undo / redo / revert) ----------
 function stageSteps(steps: Step[]): void {
   applied.push(...steps);
   redo.length = 0;
@@ -198,8 +218,6 @@ function runOp(op: OpDef, values: Record<string, string | boolean>): void {
 }
 function undo(): void {
   if (!applied.length) return;
-  // pop the last logical action — fill_nulls can be a run of same-kind steps,
-  // but for simplicity each undo removes one step; group-undo is a v2 nicety.
   redo.push([applied.pop() as Step]);
   void refresh();
 }
@@ -207,6 +225,16 @@ function redoAction(): void {
   const grp = redo.pop();
   if (!grp) return;
   applied.push(...grp);
+  void refresh();
+}
+/** Revert to a point in the timeline: keep the first `n` applied steps, send the rest to redo. */
+function undoTo(n: number): void {
+  while (applied.length > n) redo.push([applied.pop() as Step]);
+  void refresh();
+}
+/** Replay `k` undone groups back onto the pipeline (forward in the timeline). */
+function redoTo(k: number): void {
+  for (let i = 0; i < k && redo.length; i++) applied.push(...(redo.pop() as Step[]));
   void refresh();
 }
 async function exportCsv(): Promise<void> {
@@ -228,52 +256,145 @@ async function renderTable(): Promise<void> {
     }));
     return;
   }
-  const query = sort ? JSON.stringify({ sort: [{ col: sort.col, ascending: sort.ascending }] }) : null;
-  const page = JSON.parse(await engineCall<string>("view", { query, offset, limit: PAGE_LIMIT })) as Page;
+  const q: Record<string, unknown> = {};
+  if (searchQ) q.search = searchQ;
+  if (sort) q.sort = [{ col: sort.col, descending: sort.descending }];
+  const query = Object.keys(q).length ? JSON.stringify(q) : null;
+  const page = JSON.parse(await engineCall<string>("view", { query, offset, limit: pageLimit })) as Page;
+  rowIndices = page.indices ?? page.rows.map((_, i) => offset + i);
 
+  // columns the user has not toggled off, keeping the original cell index
+  const visible = page.columns.map((name, i) => ({ name, i })).filter(({ name }) => !hiddenCols.has(name));
+
+  // header: a select-all checkbox cell (CSS shows it only in select mode) + sortable columns
   const headRow = el("tr");
-  page.columns.forEach((name) => {
+  const selAll = el("input", { type: "checkbox", id: "selAll", class: "row-chk", "aria-label": "select all rows on this page" }) as HTMLInputElement;
+  const onPage = rowIndices.filter((ix) => selectedRows.has(ix)).length;
+  selAll.checked = rowIndices.length > 0 && onPage === rowIndices.length;
+  selAll.indeterminate = onPage > 0 && onPage < rowIndices.length;
+  headRow.append(el("th", { class: "col-chk" }, selAll));
+  visible.forEach(({ name }) => {
     const meta = cols.find((c) => c.name === name);
-    const indicator = sort?.col === name ? (sort.ascending ? " ▲" : " ▼") : "";
-    const th = el("th", {},
+    const indicator = sort?.col === name ? (sort.descending ? " ▼" : " ▲") : "";
+    headRow.append(el("th", { class: "sortable", "data-col": name, title: `Sort by ${name}` },
       el("span", { class: "th-name" }, name),
       meta ? el("span", { class: `dtype dtype-${meta.dtype}` }, meta.dtype) : null,
-      indicator);
-    th.addEventListener("click", () => {
-      if (sort?.col === name) sort = { col: name, ascending: !sort.ascending };
-      else sort = { col: name, ascending: true };
-      void renderTable();
-    });
-    headRow.append(th);
+      indicator));
   });
 
+  // body: each row carries its frame index; cells are editable in edit mode
+  const editable = mode === "edit";
   const body = el("tbody");
-  for (const row of page.rows) {
-    const tr = el("tr");
-    row.forEach((cell) => tr.append(el("td", { class: cell == null ? "null" : "" }, cell == null ? "—" : cell)));
+  page.rows.forEach((row, r) => {
+    const absIdx = rowIndices[r]!; // rowIndices is built parallel to page.rows (see above), so r is always in range
+    const tr = el("tr", { "data-idx": String(absIdx), class: selectedRows.has(absIdx) ? "is-selected" : "" });
+    const rowCb = el("input", { type: "checkbox", class: "row-chk", checked: selectedRows.has(absIdx), "aria-label": "select row" }) as HTMLInputElement;
+    tr.append(el("td", { class: "col-chk" }, rowCb));
+    visible.forEach(({ name, i }) => {
+      const cell = row[i];
+      const display = cell == null ? (editable ? "" : "—") : cell;
+      tr.append(el("td", {
+        class: cell == null ? "null cell" : "cell",
+        "data-col": name,
+        "data-orig": display,
+        contenteditable: editable ? "true" : null,
+      }, display));
+    });
     body.append(tr);
-  }
-  host.replaceChildren(el("div", { class: "wrap" }, el("table", {}, el("thead", {}, headRow), body)));
+  });
+
+  host.replaceChildren(el("div", { class: "wrap" },
+    el("table", { class: `dt mode-${mode || "view"}` }, el("thead", {}, headRow), body)));
   renderPager(page.total);
 }
 
 function renderPager(total: number): void {
-  const to = Math.min(offset + PAGE_LIMIT, total);
+  const to = Math.min(offset + pageLimit, total);
   setKids(byId("count"),
     el("span", {}, `${total.toLocaleString()} rows × ${cols.length} cols`),
     el("span", { class: "muted" }, total ? `  ·  showing ${offset + 1}–${to}` : ""),
-    total > PAGE_LIMIT ? iconButton("‹", { label: "previous page", size: "sm", onClick: () => { if (offset > 0) { offset = Math.max(0, offset - PAGE_LIMIT); void renderTable(); } } }) : null,
-    total > PAGE_LIMIT ? iconButton("›", { label: "next page", size: "sm", onClick: () => { if (offset + PAGE_LIMIT < total) { offset += PAGE_LIMIT; void renderTable(); } } }) : null,
+    searchQ ? el("span", { class: "muted" }, `  ·  matching “${searchQ}”`) : null,
+    total > pageLimit ? iconButton("‹", { label: "previous page", size: "sm", onClick: () => { if (offset > 0) { offset = Math.max(0, offset - pageLimit); void renderTable(); } } }) : null,
+    total > pageLimit ? iconButton("›", { label: "next page", size: "sm", onClick: () => { if (offset + pageLimit < total) { offset += pageLimit; void renderTable(); } } }) : null,
   );
 }
 
-// ---------- rendering: tools panel ----------
+// Delegated table interactions — attached once to the persistent #table host, so they
+// survive every renderTable() repaint and read the live state at event time.
+function wireTable(): void {
+  const host = byId("table");
+  host.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    if (t.closest("input")) return; // checkboxes are handled on 'change'
+    const th = t.closest("th.sortable") as HTMLElement | null;
+    if (th) { onSort(th.getAttribute("data-col") as string); return; }
+    if (mode === "delete") {
+      const tr = t.closest("tr[data-idx]") as HTMLElement | null;
+      if (tr) stageSteps([step("drop_rows", { indices: [Number(tr.getAttribute("data-idx"))] })]);
+    }
+  });
+  host.addEventListener("change", (e) => {
+    const t = e.target as HTMLInputElement;
+    if (t.id === "selAll") { toggleSelectAll(t.checked); return; }
+    if (t.classList.contains("row-chk")) {
+      const tr = t.closest("tr[data-idx]") as HTMLElement;
+      const idx = Number(tr.getAttribute("data-idx"));
+      if (t.checked) selectedRows.add(idx); else selectedRows.delete(idx);
+      tr.classList.toggle("is-selected", t.checked);
+      syncSelChip();
+      syncSelAll();
+    }
+  });
+  host.addEventListener("focusout", (e) => {
+    if (mode !== "edit") return;
+    const td = (e.target as HTMLElement).closest("td.cell") as HTMLElement | null;
+    if (!td || td.getAttribute("contenteditable") !== "true") return;
+    const orig = td.getAttribute("data-orig") ?? "";
+    const next = (td.textContent ?? "").trim();
+    if (next === orig) return;
+    const tr = td.closest("tr[data-idx]") as HTMLElement;
+    stageSteps([step("set_cell", {
+      row: Number(tr.getAttribute("data-idx")),
+      column: td.getAttribute("data-col"),
+      value: next === "" ? null : next,
+    })]);
+  });
+}
+
+function onSort(colName: string): void {
+  sort = sort?.col === colName ? { col: colName, descending: !sort.descending } : { col: colName, descending: false };
+  offset = 0;
+  void renderTable();
+}
+
+function toggleSelectAll(checked: boolean): void {
+  for (const ix of rowIndices) { if (checked) selectedRows.add(ix); else selectedRows.delete(ix); }
+  byId("table").querySelectorAll<HTMLInputElement>("tbody .row-chk").forEach((cb) => {
+    cb.checked = checked;
+    cb.closest("tr")?.classList.toggle("is-selected", checked);
+  });
+  syncSelChip();
+}
+function syncSelAll(): void {
+  const selAll = document.getElementById("selAll") as HTMLInputElement | null;
+  if (!selAll) return;
+  const onPage = rowIndices.filter((ix) => selectedRows.has(ix)).length;
+  selAll.checked = rowIndices.length > 0 && onPage === rowIndices.length;
+  selAll.indeterminate = onPage > 0 && onPage < rowIndices.length;
+}
+function clearSelection(): void {
+  selectedRows.clear();
+  byId("table").querySelectorAll<HTMLInputElement>(".row-chk").forEach((cb) => { cb.checked = false; cb.indeterminate = false; });
+  byId("table").querySelectorAll(".is-selected").forEach((r) => r.classList.remove("is-selected"));
+  syncSelChip();
+}
+
+// ---------- rendering: tools panel (Clean ops + the History strip) ----------
 function renderTools(): void {
   const host = byId("tools");
   if (!cols.length) { host.replaceChildren(); return; }
   const n = selection.size;
 
-  // column list
   const list = el("div", { class: "col-list" });
   cols.forEach((c) => {
     const cb = el("input", { type: "checkbox", checked: selection.has(c.name) }) as HTMLInputElement;
@@ -296,12 +417,14 @@ function renderTools(): void {
     el("div", { class: "tools-head" }, el("h2", {}, "Tools"),
       el("span", { class: "spacer" }),
       n ? button(`Clear (${n})`, { variant: "ghost", size: "sm", onClick: () => { selection.clear(); activeOp = null; renderTools(); } }) : null),
-    el("div", { class: "tools-section" }, el("h3", {}, "Columns"), list),
-    el("div", { class: "tools-section" }, el("h3", {}, "Whole file"), el("div", { class: "op-grid" }, ...GLOBAL_OPS.map(opBtn))),
-    el("div", { class: "tools-section" },
-      el("h3", {}, "Selected columns", n ? el("span", { class: "sel-count" }, ` · ${n} selected`) : null),
-      el("div", { class: "op-grid" }, ...COLUMN_OPS.map(opBtn))),
-    activeOp ? actionSheet(activeOp) : null,
+    el("div", { class: "tools-body" },
+      el("div", { class: "tools-section" }, el("h3", {}, "Columns"), list),
+      el("div", { class: "tools-section" }, el("h3", {}, "Whole file"), el("div", { class: "op-grid" }, ...GLOBAL_OPS.map(opBtn))),
+      el("div", { class: "tools-section" },
+        el("h3", {}, "Selected columns", n ? el("span", { class: "sel-count" }, ` · ${n} selected`) : null),
+        el("div", { class: "op-grid" }, ...COLUMN_OPS.map(opBtn))),
+      activeOp ? actionSheet(activeOp) : null),
+    historySection(),
   );
 }
 
@@ -333,6 +456,116 @@ function actionSheet(op: OpDef): HTMLElement {
       button("Apply", { variant: "primary", size: "sm", onClick: () => runOp(op, values) })));
 }
 
+// The always-visible step timeline pinned to the bottom of the tools panel. Past steps are solid,
+// the current point is highlighted, undone steps are faint — click any to jump there (undo/redo-to).
+function historySection(): HTMLElement {
+  const items: HTMLElement[] = [];
+  items.push(histRow("Original dataset", () => undoTo(0), applied.length === 0 ? "is-current" : "is-done"));
+  applied.forEach((s, i) => items.push(histRow(stepLabel(s), () => undoTo(i + 1), i === applied.length - 1 ? "is-current" : "is-done")));
+  // undone steps, in forward order, so the user can replay them
+  const redoable = [...redo].reverse().flatMap((g) => g);
+  redoable.forEach((s, i) => items.push(histRow(stepLabel(s), () => redoTo(i + 1), "is-future")));
+  return el("div", { class: "tools-section history" },
+    el("div", { class: "history-head" },
+      el("h3", {}, "History"),
+      el("span", { class: "sel-count" }, ` · ${applied.length} step${applied.length === 1 ? "" : "s"}`)),
+    el("div", { class: "hist-list" }, ...items));
+}
+function histRow(label: string, onClick: () => void, cls: string): HTMLElement {
+  return el("button", { class: `hist-item ${cls}`, type: "button", title: "Revert to this point", onclick: onClick },
+    el("span", { class: "hist-dot" }),
+    el("span", { class: "hist-label" }, label));
+}
+function stepLabel(s: Step): string {
+  const op = OPS.find((o) => o.id === s.kind);
+  if (op) return op.label.replace(/…$/, "");
+  switch (s.kind) {
+    case "set_cell": return `Edit cell · ${String(s.params.column ?? "")}`;
+    case "drop_rows": { const k = (s.params.indices as unknown[])?.length ?? 0; return `Delete ${k} row${k === 1 ? "" : "s"}`; }
+    case "original": return "Original";
+    default: return s.kind.replace(/_/g, " ");
+  }
+}
+
+// ---------- toolbar pieces ----------
+function searchBox(): HTMLElement {
+  const inp = el("input", { type: "search", class: "dt-search-input", placeholder: "Search all columns…", "aria-label": "search the table" }) as HTMLInputElement;
+  inp.addEventListener("input", () => {
+    const v = inp.value.trim();
+    if (v === searchQ) return;
+    searchQ = v;
+    if (searchDebounce !== undefined) clearTimeout(searchDebounce);
+    searchDebounce = window.setTimeout(() => { offset = 0; void renderTable(); }, 180);
+  });
+  return el("div", { class: "dt-search" }, el("span", { class: "dt-search-ico" }, "⌕"), inp);
+}
+
+function modeButton(m: Mode, glyph: string, title: string): HTMLElement {
+  const b = iconButton(glyph, { label: title, size: "sm", onClick: () => {
+    // bulk shortcut: hitting Delete with rows selected removes them in one step
+    if (m === "delete" && selectedRows.size) { stageSteps([step("drop_rows", { indices: [...selectedRows] })]); return; }
+    setMode(mode === m ? "" : m);
+  } });
+  b.classList.add("dt-mode");
+  b.setAttribute("data-mode", m as string);
+  b.setAttribute("title", title);
+  return b;
+}
+function setMode(m: Mode): void {
+  mode = m;
+  selectedRows.clear();
+  document.querySelectorAll<HTMLElement>(".dt-mode").forEach((b) => b.classList.toggle("is-active", b.getAttribute("data-mode") === m && m !== ""));
+  syncSelChip();
+  void renderTable();
+}
+
+function rowsPerPage(): HTMLElement {
+  const field = select({ size: "sm", children: [50, 100, 200, 500].map((nn) => el("option", { value: String(nn), selected: nn === pageLimit }, `${nn}/page`)) });
+  const sel = field.querySelector("select") as HTMLSelectElement;
+  sel.addEventListener("change", () => { pageLimit = Number(sel.value); offset = 0; void renderTable(); });
+  field.classList.add("dt-rows");
+  return field;
+}
+
+function columnsDropdown(): HTMLElement {
+  const menu = el("div", { class: "dt-menu", hidden: true });
+  const toggle = iconButton("▦", { label: "Show / hide columns", size: "sm", onClick: () => {
+    if (menu.hasAttribute("hidden")) { fillColumnsMenu(menu); menu.removeAttribute("hidden"); }
+    else menu.setAttribute("hidden", "");
+  } });
+  toggle.setAttribute("title", "Show / hide columns");
+  const wrap = el("div", { class: "dt-dd" }, toggle, menu);
+  document.addEventListener("click", (e) => { if (!wrap.contains(e.target as Node)) menu.setAttribute("hidden", ""); });
+  return wrap;
+}
+function fillColumnsMenu(menu: HTMLElement): void {
+  setKids(menu, ...cols.map((c) => {
+    const cb = el("input", { type: "checkbox", checked: !hiddenCols.has(c.name) }) as HTMLInputElement;
+    cb.addEventListener("change", () => { cb.checked ? hiddenCols.delete(c.name) : hiddenCols.add(c.name); void renderTable(); });
+    return el("label", { class: "dt-menu-item" }, cb, el("span", { class: "dt-menu-name" }, c.name));
+  }));
+}
+
+function syncSelChip(): void {
+  const chip = byId("selChip");
+  const n = selectedRows.size;
+  chip.classList.toggle("show", n > 0);
+  setKids(chip,
+    n ? el("span", { class: "sel-n" }, `${n} selected`) : null,
+    n ? button("Delete rows", { variant: "secondary", size: "sm", onClick: () => { if (selectedRows.size) stageSteps([step("drop_rows", { indices: [...selectedRows] })]); } }) : null,
+    n ? iconButton("✕", { label: "clear selection", size: "sm", onClick: clearSelection }) : null,
+  );
+}
+function syncToolbar(): void {
+  undoBtn?.classList.toggle("is-off", applied.length === 0);
+  redoBtn?.classList.toggle("is-off", redo.length === 0);
+}
+function resetToolbarUi(): void {
+  const si = document.querySelector(".dt-search-input") as HTMLInputElement | null;
+  if (si) si.value = "";
+  document.querySelectorAll<HTMLElement>(".dt-mode").forEach((b) => b.classList.remove("is-active"));
+}
+
 // ---------- chrome ----------
 function renderChip(): void {
   const host = byId("chip");
@@ -347,23 +580,43 @@ function buildChrome(): void {
   file.hidden = true;
   file.addEventListener("change", () => void openFile(file.files?.[0]));
 
+  undoBtn = iconButton("↶", { label: "undo", size: "sm", onClick: undo });
+  redoBtn = iconButton("↷", { label: "redo", size: "sm", onClick: redoAction });
+  undoBtn.setAttribute("title", "Undo");
+  redoBtn.setAttribute("title", "Redo");
+
   const header = el("header", { class: "app-header" },
     el("h1", {}, "csv-workbench"),
     el("span", { class: "muted" }, "clean & transform CSVs in your browser"),
     el("span", { id: "status", class: "status" }),
     el("span", { class: "spacer" }),
     el("span", { id: "chip", class: "chip" }),
-    iconButton("↶", { label: "undo", size: "sm", onClick: undo }),
-    iconButton("↷", { label: "redo", size: "sm", onClick: redoAction }),
     button("Load sample", { onClick: loadSample }),
     button("Open CSV", { variant: "primary", onClick: () => file.click() }),
     button("Export CSV", { onClick: () => void exportCsv() }),
     file);
 
+  const toolbar = el("div", { class: "dt-toolbar" },
+    searchBox(),
+    el("span", { class: "dt-sep" }),
+    modeButton("edit", "✎", "Edit cells"),
+    modeButton("select", "☑", "Select rows"),
+    modeButton("delete", "🗑", "Delete rows"),
+    el("span", { class: "dt-sep" }),
+    undoBtn, redoBtn,
+    el("span", { class: "dt-sep" }),
+    rowsPerPage(),
+    columnsDropdown(),
+    el("span", { id: "selChip", class: "dt-selchip" }),
+    el("span", { class: "spacer" }));
+
   byId("root").append(
     header,
+    toolbar,
     el("div", { id: "count", class: "count" }),
     el("main", { class: "layout" }, el("section", { id: "table", class: "table-pane" }), el("aside", { id: "tools", class: "tools-pane" })));
+
+  wireTable();
 }
 
 // ---------- init ----------

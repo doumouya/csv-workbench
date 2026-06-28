@@ -22,6 +22,11 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
+/// Transient name for the row-index column `view` stamps on the current frame before any ephemeral
+/// filter/sort. It is split back out by `page_indexed` and never reaches the wire — chosen to be
+/// unlikely to collide with a real CSV column.
+const ROW_IDX: &str = "__cw_row_idx";
+
 /// The quality report over a frame — `summarize` → `cleanness_report` +
 /// sentinels. Shared by `parse_score` (which adds encoding + rescue) and
 /// `Workbook::score`, so the payload is the SAME object on both paths.
@@ -112,7 +117,10 @@ impl Workbook {
 
     /// The composable window over the current frame. `query_json` is the
     /// canonical `QuerySpec` `{ filter?, search?, sort? }` (null/`{}` = whole
-    /// frame). Applies **(filter AND search) → sort → page**.
+    /// frame). Applies **(filter AND search) → sort → page**, and returns each
+    /// row's STABLE index in the current frame (`indices`) alongside the cells —
+    /// so a cell-edit / row-delete maps back to the right `df` row even after a
+    /// sort or search reorders/hides rows.
     pub fn view(
         &self,
         query_json: Option<String>,
@@ -123,22 +131,31 @@ impl Workbook {
             Some(j) => serde_json::from_str(j).map_err(|e| JsError::new(&e.to_string()))?,
             None => QuerySpec::default(),
         };
+        // Stamp a stable row index over the CURRENT frame BEFORE any ephemeral filter/sort, so the
+        // page can report each surviving row's position in `df` (what set_cell/drop_rows address).
+        let indexed = self
+            .df
+            .clone()
+            .lazy()
+            .with_row_index(ROW_IDX, None)
+            .collect()
+            .map_err(|e| JsError::new(&e.to_string()))?;
         let filtered: Option<DataFrame> =
             match crate::search::effective_filter(&self.df, q.filter.as_ref(), q.search.as_deref()) {
                 Some(f) => Some(
-                    crate::filter::apply_filter(&self.df, &f)
+                    crate::filter::apply_filter(&indexed, &f)
                         .map_err(|e| JsError::new(&e.to_string()))?,
                 ),
                 None => None,
             };
-        let base: &DataFrame = filtered.as_ref().unwrap_or(&self.df);
+        let base: &DataFrame = filtered.as_ref().unwrap_or(&indexed);
         let sorted: Option<DataFrame> = if q.sort.is_empty() {
             None
         } else {
             Some(crate::sort::apply_sort(base, &q.sort).map_err(|e| JsError::new(&e.to_string()))?)
         };
         let out: &DataFrame = sorted.as_ref().unwrap_or(base);
-        let p = crate::view::page(out, offset, limit);
+        let p = crate::view::page_indexed(out, ROW_IDX, offset, limit);
         Ok(p.to_json().to_string())
     }
 

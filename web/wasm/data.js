@@ -199,7 +199,10 @@ let wasm_bindgen = (function(exports) {
         /**
          * The composable window over the current frame. `query_json` is the
          * canonical `QuerySpec` `{ filter?, search?, sort? }` (null/`{}` = whole
-         * frame). Applies **(filter AND search) → sort → page**.
+         * frame). Applies **(filter AND search) → sort → page**, and returns each
+         * row's STABLE index in the current frame (`indices`) alongside the cells —
+         * so a cell-edit / row-delete maps back to the right `df` row even after a
+         * sort or search reorders/hides rows.
          * @param {string | null | undefined} query_json
          * @param {number} offset
          * @param {number} limit

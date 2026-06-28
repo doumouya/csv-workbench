@@ -48,6 +48,50 @@ impl Page {
     }
 }
 
+/// A page that also carries each row's STABLE index in the current frame. The caller stamps an `idx_col`
+/// (a `with_row_index` column) on the frame BEFORE any ephemeral filter/sort; `page_indexed` then splits it
+/// out into `indices` and excludes it from `columns`/`rows`. That lets a UI map a displayed row back to its
+/// real position in the frame — so cell-edit / row-delete hit the right row even after a sort or search.
+pub struct PageIndexed {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub total: usize,
+    pub indices: Vec<u32>,
+}
+
+pub fn page_indexed(df: &DataFrame, idx_col: &str, offset: usize, limit: usize) -> PageIndexed {
+    let total = df.height();
+    let all = df.columns();
+    let data: Vec<&Column> = all.iter().filter(|c| c.name().as_str() != idx_col).collect();
+    let idx = df.column(idx_col).ok();
+    let columns: Vec<String> = data.iter().map(|c| c.name().to_string()).collect();
+    let end = offset.saturating_add(limit).min(total);
+    let start = offset.min(total);
+    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+    let mut indices = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        rows.push(data.iter().copied().map(|c| cell(c, i)).collect());
+        let ix = idx
+            .and_then(|c| c.get(i).ok())
+            .and_then(|v| v.extract::<u64>())
+            .unwrap_or(0);
+        indices.push(ix as u32);
+    }
+    PageIndexed { columns, rows, total, indices }
+}
+
+impl PageIndexed {
+    /// `{ columns, rows, total, indices }` — `page`'s shape plus the per-row stable frame index.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "columns": self.columns,
+            "rows": self.rows,
+            "total": self.total,
+            "indices": self.indices,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
