@@ -406,6 +406,23 @@
   function setKids(host, ...kids) {
     host.replaceChildren(...kids.filter((k) => k != null && k !== false));
   }
+  var SAMPLE_CSV = `ID Client,Nom complet,Ville,R\xE9gion,Chiffre d'affaires,Actif ?,Date d'inscription
+1,Marie Dupont,Paris,\xCEle-de-France,"12 500,00",oui,14/03/2024
+2,Liam O'Brien ,Rennes,Bretagne,"8 750,50",non,02/11/2023
+3,Sofia Rossi,Toulouse,Occitanie,"1 299,90",OUI,28/02/2024
+4,Hans Becker,Strasbourg,Grand Est,"23 400,00",oui,
+5,Am\xE9lie Laurent,Paris,\xCEle-de-France,"5 600,75",non,07/07/2023
+6,Lucas Martin,Nantes,Pays de la Loire,"940,20",oui,19/09/2024
+7,,Lyon,Auvergne-Rh\xF4ne-Alpes,"15 250,00",oui,11/01/2024
+8,Chen Wei,Paris,\xEEle-de-france,"3 420,10",non,05/05/2024
+9,Olivia Brown,Bordeaux,Nouvelle-Aquitaine,,Oui,23/08/2023
+10,L\xE9a Moreau,Rennes,Bretagne,"7 800,00",oui,30/04/2024
+11,Thomas Petit,Marseille,PACA,"19 999,99",NON,12/12/2023
+12,Camille Roux,Toulouse,Occitanie,"2 150,40",oui,08/06/2024
+`;
+  function loadSample() {
+    void openFile(new File([SAMPLE_CSV], "sample-clients-fr.csv", { type: "text/csv" }));
+  }
   async function openFile(file) {
     if (!file) return;
     setStatus(`Parsing ${file.name}\u2026`);
@@ -481,7 +498,7 @@
         dropzone: true,
         glyph: "\u25A6",
         lead: "Open a CSV \u2014 it stays on your device.",
-        description: "Parsed and cleaned entirely in your browser by a Polars\u2192WebAssembly engine. Nothing is uploaded."
+        description: "Parsed and cleaned entirely in your browser by a Polars\u2192WebAssembly engine. Nothing is uploaded. No file handy? Click \u201CLoad sample\u201D to try it on a messy French dataset."
       }));
       return;
     }
@@ -663,6 +680,7 @@
       el("span", { id: "chip", class: "chip" }),
       iconButton("\u21B6", { label: "undo", size: "sm", onClick: undo }),
       iconButton("\u21B7", { label: "redo", size: "sm", onClick: redoAction }),
+      button("Load sample", { onClick: loadSample }),
       button("Open CSV", { variant: "primary", onClick: () => file.click() }),
       button("Export CSV", { onClick: () => void exportCsv() }),
       file

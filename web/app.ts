@@ -121,6 +121,28 @@ function setKids(host: HTMLElement, ...kids: (Node | string | null | undefined |
   host.replaceChildren(...kids.filter((k): k is Node | string => k != null && k !== false));
 }
 
+// ---------- sample data ----------
+// A synthetic French clients extract — deliberately messy (accented/spaced headers, French
+// decimals like "12 500,00", mixed oui/non casing, day-first dates, blank cells) so the
+// cleaning engine has something real to fix. Synthetic on purpose: no real data ships here.
+const SAMPLE_CSV = `ID Client,Nom complet,Ville,Région,Chiffre d'affaires,Actif ?,Date d'inscription
+1,Marie Dupont,Paris,Île-de-France,"12 500,00",oui,14/03/2024
+2,Liam O'Brien ,Rennes,Bretagne,"8 750,50",non,02/11/2023
+3,Sofia Rossi,Toulouse,Occitanie,"1 299,90",OUI,28/02/2024
+4,Hans Becker,Strasbourg,Grand Est,"23 400,00",oui,
+5,Amélie Laurent,Paris,Île-de-France,"5 600,75",non,07/07/2023
+6,Lucas Martin,Nantes,Pays de la Loire,"940,20",oui,19/09/2024
+7,,Lyon,Auvergne-Rhône-Alpes,"15 250,00",oui,11/01/2024
+8,Chen Wei,Paris,île-de-france,"3 420,10",non,05/05/2024
+9,Olivia Brown,Bordeaux,Nouvelle-Aquitaine,,Oui,23/08/2023
+10,Léa Moreau,Rennes,Bretagne,"7 800,00",oui,30/04/2024
+11,Thomas Petit,Marseille,PACA,"19 999,99",NON,12/12/2023
+12,Camille Roux,Toulouse,Occitanie,"2 150,40",oui,08/06/2024
+`;
+function loadSample(): void {
+  void openFile(new File([SAMPLE_CSV], "sample-clients-fr.csv", { type: "text/csv" }));
+}
+
 // ---------- import / refresh ----------
 async function openFile(file: File | undefined): Promise<void> {
   if (!file) return;
@@ -202,7 +224,7 @@ async function renderTable(): Promise<void> {
     host.replaceChildren(emptyState({
       dropzone: true, glyph: "▦",
       lead: "Open a CSV — it stays on your device.",
-      description: "Parsed and cleaned entirely in your browser by a Polars→WebAssembly engine. Nothing is uploaded.",
+      description: "Parsed and cleaned entirely in your browser by a Polars→WebAssembly engine. Nothing is uploaded. No file handy? Click “Load sample” to try it on a messy French dataset.",
     }));
     return;
   }
@@ -333,6 +355,7 @@ function buildChrome(): void {
     el("span", { id: "chip", class: "chip" }),
     iconButton("↶", { label: "undo", size: "sm", onClick: undo }),
     iconButton("↷", { label: "redo", size: "sm", onClick: redoAction }),
+    button("Load sample", { onClick: loadSample }),
     button("Open CSV", { variant: "primary", onClick: () => file.click() }),
     button("Export CSV", { onClick: () => void exportCsv() }),
     file);
